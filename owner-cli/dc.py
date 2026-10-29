@@ -224,6 +224,14 @@ def cmd_provision(args: argparse.Namespace) -> int:
     if AGENT_SOURCE.is_file():
         shutil.copy2(AGENT_SOURCE, target / "agent.py")
     print(f"Prepared {target}: {CONFIG_NAME}, agent.py and Inbox/")
+
+    # Tell the server the program is on the drive so the dashboard shows it.
+    try:
+        _request("POST", f"/api/drives/{drive_id}/installed")
+    except CliError as exc:
+        print(f"  warning: could not report the install to the server: {exc}",
+              file=sys.stderr)
+
     print("The recipient starts agent.py themselves; nothing runs automatically.")
     return 0
 

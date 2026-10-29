@@ -55,6 +55,10 @@ python -m venv .venv
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 export DC_ADMIN_KEY=<that value>               # Windows: setx DC_ADMIN_KEY "<that value>"
 
+# Optional: password for the owner dashboard at /dashboard
+python -c "import secrets; print(secrets.token_urlsafe(24))"
+export DC_DASHBOARD_PASSWORD=<that value>       # Windows: setx DC_DASHBOARD_PASSWORD "<that value>"
+
 .venv/bin/python -m server                     # http://127.0.0.1:8000, data in ./data
 ```
 
@@ -63,9 +67,35 @@ Server environment variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DC_ADMIN_KEY` | *(required, 16+ chars)* | Owner key for the CLI and owner endpoints |
+| `DC_DASHBOARD_PASSWORD` | *(unset = dashboard disabled)* | Password for the owner web dashboard at `/dashboard` |
 | `DC_DATA_DIR` | `./data` | SQLite database and uploaded files |
 | `DC_HOST` / `DC_PORT` | `127.0.0.1` / `8000` | Listen address. Put it behind HTTPS before exposing it |
 | `DC_MAX_FILE_BYTES` | `52428800` (50 MiB) | Per-file upload limit |
+
+## Owner dashboard
+
+Set `DC_DASHBOARD_PASSWORD` and open `http://<host>:8000/dashboard`. Sign in with that password
+and you get one row per flash drive:
+
+- **Status** — Online if the drive's agent checked in within the last 90 seconds, otherwise
+  Offline (with the time it was last seen). Revoked drives are flagged and always shown offline.
+- **Program** — Installed once the CLI provisions the drive or the agent connects for the first
+  time, so you can tell which sticks actually carry the program.
+- Pending file count, when the drive was added, and a running total of drives, online drives,
+  installed drives and queued files.
+- **Actions** per drive: **Send** queues one or more files with an optional note (same size,
+  type and hashing rules as the CLI), **Revoke** disables the drive for good after a confirmation,
+  and **Rotate** issues a new token and shows it once for you to update the drive. Revoked
+  drives show no actions.
+
+The page refreshes itself every 15 seconds. Sessions are an `HttpOnly` cookie signed with the
+admin key and expire after 12 hours; sign out from the header. The same data is available to
+tools at `GET /api/dashboard/drives` with either the session cookie or `X-Admin-Key`. Action
+requests from the page also send `X-Dashboard-Request: 1`, which stops another site from posting
+with your session cookie; scripts using `X-Admin-Key` do not need it.
+
+Put the server behind HTTPS before exposing it, since the password and session cookie travel
+with every request.
 
 ## Owner workflow
 
@@ -119,6 +149,7 @@ Owner endpoints require the `X-Admin-Key` header. Agent endpoints require
 | `POST` | `/api/drives/{id}/files` | owner | Upload (`file` part, optional `note` form field) |
 | `GET` | `/api/drives/{id}/files` | owner | Queue with `delivered_at` receipts |
 | `DELETE` | `/api/drives/{id}/files/{file_id}` | owner | Remove a file and its bytes |
+| `POST` | `/api/drives/{id}/installed` | owner | Record that the agent files were written to the drive |
 | `POST` | `/api/drives/{id}/revoke` | owner | Permanently disable the drive token |
 | `POST` | `/api/drives/{id}/rotate-token` | owner | Issue a new token, invalidating the old one |
 | `GET` | `/api/agent/me` | agent | Drive name, used by the first-run screen |
@@ -126,6 +157,11 @@ Owner endpoints require the `X-Admin-Key` header. Agent endpoints require
 | `GET` | `/api/agent/files/{file_id}` | agent | Download; `X-Content-Sha256` header |
 | `POST` | `/api/agent/files/{file_id}/ack` | agent | Confirm delivery with the `sha256` form field |
 | `GET` | `/api/health` | anyone | Liveness probe |
+| `GET` | `/api/dashboard/drives` | owner | Overview rows with `online` / `installed` state |
+| `POST` | `/api/dashboard/drives/{id}/files` | owner | Upload from the dashboard (session) |
+| `POST` | `/api/dashboard/drives/{id}/revoke` | owner | Revoke from the dashboard (session) |
+| `POST` | `/api/dashboard/drives/{id}/rotate-token` | owner | Rotate from the dashboard (session) |
+| `GET` | `/dashboard` | owner | Login page, or the drive overview with a session |
 
 Interactive docs are at `/docs` while the server runs.
 
@@ -138,6 +174,7 @@ Direct-Connection/
     db.py            # drives + files tables
     storage.py       # sanitizing, size limits, hashing, atomic writes
     config.py        # environment-driven settings
+    dashboard.py     # owner login page and drive overview (HTML + vanilla JS)
   owner-cli/dc.py    # owner tool (stdlib only)
   agent/agent.py     # portable agent for the drive (stdlib + tkinter)
   tests/             # API and end-to-end agent tests
@@ -156,7 +193,7 @@ downloads, blocked file types, name collisions and revocation.
 
 ## Roadmap
 
-- Owner web dashboard with login and drive management
+- Owner web dashboard: login, overview and per-drive actions (send, revoke, rotate) are done
 - Optional end-to-end encryption of files
 - Auto-update for the agent
 - Windows, macOS and Linux builds of the agent (PyInstaller)

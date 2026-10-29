@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS drives (
     token_hash  TEXT NOT NULL UNIQUE,
     created_at  REAL NOT NULL,
     revoked     INTEGER NOT NULL DEFAULT 0,
-    last_seen_at REAL
+    last_seen_at REAL,
+    installed_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -40,6 +41,13 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            # Older databases predate the installed_at column.
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(drives)").fetchall()
+            }
+            if "installed_at" not in columns:
+                conn.execute("ALTER TABLE drives ADD COLUMN installed_at REAL")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -108,6 +116,14 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 "UPDATE drives SET last_seen_at = ? WHERE id = ?", (time.time(), drive_id)
+            )
+
+    def mark_installed(self, drive_id: str) -> None:
+        """Record the first time the agent was written to the drive."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE drives SET installed_at = COALESCE(installed_at, ?) WHERE id = ?",
+                (time.time(), drive_id),
             )
 
     # -- files ----------------------------------------------------------

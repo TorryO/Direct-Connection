@@ -12,21 +12,30 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .dashboard import render_dashboard, render_login
 from .db import Database
 from .storage import FileRejected, FileStorage, check_allowed, sanitize_filename
 
 NOTE_MAX_LENGTH = 2000
 QUEUE_LIMIT = 100
+
+# The dashboard calls a drive "online" when its agent has checked in this recently.
+# Agents poll every 30s by default, so this tolerates a missed poll or two.
+ONLINE_WINDOW_SECONDS = 90
+
+SESSION_COOKIE = "dc_session"
+SESSION_TTL_SECONDS = 12 * 60 * 60
 
 
 class DriveCreate(BaseModel):
@@ -47,6 +56,29 @@ def _new_token() -> str:
     return "dc_" + secrets.token_urlsafe(32)
 
 
+def _sign_session(secret: str, issued: int) -> str:
+    message = f"dc-dashboard-session:{issued}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def _new_session(secret: str) -> str:
+    issued = int(time.time())
+    return f"{issued}.{_sign_session(secret, issued)}"
+
+
+def _session_valid(secret: str, value: str | None) -> bool:
+    if not value:
+        return False
+    issued_raw, _, signature = value.partition(".")
+    try:
+        issued = int(issued_raw)
+    except ValueError:
+        return False
+    if time.time() - issued > SESSION_TTL_SECONDS:
+        return False
+    return hmac.compare_digest(signature, _sign_session(secret, issued))
+
+
 def _drive_public(drive: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": drive["id"],
@@ -54,7 +86,25 @@ def _drive_public(drive: dict[str, Any]) -> dict[str, Any]:
         "created_at": _iso(drive["created_at"]),
         "revoked": bool(drive["revoked"]),
         "last_seen_at": _iso(drive.get("last_seen_at")),
+        "installed_at": _iso(drive.get("installed_at")),
         "pending_count": drive.get("pending_count"),
+    }
+
+
+def _dashboard_drive(drive: dict[str, Any], now: float) -> dict[str, Any]:
+    """A drive row for the overview page: public fields plus vague status."""
+    last_seen = drive.get("last_seen_at")
+    installed_at = drive.get("installed_at")
+    revoked = bool(drive["revoked"])
+    return {
+        **_drive_public(drive),
+        "online": bool(
+            not revoked and last_seen is not None and now - last_seen <= ONLINE_WINDOW_SECONDS
+        ),
+        # Provisioned by the CLI, or the agent has connected at least once.
+        "installed": installed_at is not None or last_seen is not None,
+        "agent_seen": last_seen is not None,
+        "pending_count": drive.get("pending_count") or 0,
     }
 
 
@@ -94,6 +144,49 @@ def create_app(settings: Settings) -> FastAPI:
                 detail="Missing or invalid admin key.",
             )
 
+    def require_owner(
+        request: Request,
+        x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
+    ) -> None:
+        """Dashboard API auth: a signed session cookie, or the admin key."""
+        if x_admin_key and hmac.compare_digest(x_admin_key, settings.admin_key):
+            return
+        if _session_valid(
+            settings.admin_key, request.cookies.get(SESSION_COOKIE)
+        ):
+            return
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid dashboard session.",
+        )
+
+    def require_owner_action(
+        request: Request,
+        x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
+        x_dashboard_request: Annotated[
+            str | None, Header(alias="X-Dashboard-Request")
+        ] = None,
+    ) -> None:
+        """Auth for state-changing dashboard calls.
+
+        The admin key is enough for scripts. A session cookie only counts when
+        the page also sends ``X-Dashboard-Request``, which a cross-site form or
+        fetch cannot add without a CORS preflight this server never grants.
+        """
+        if x_admin_key and hmac.compare_digest(x_admin_key, settings.admin_key):
+            return
+        if _session_valid(settings.admin_key, request.cookies.get(SESSION_COOKIE)):
+            if x_dashboard_request == "1":
+                return
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Missing X-Dashboard-Request header.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid dashboard session.",
+        )
+
     def require_drive(
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
@@ -124,6 +217,125 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="Drive not found.")
         return drive
 
+    # -- dashboard -------------------------------------------------------
+
+    def _no_store(response: HTMLResponse) -> HTMLResponse:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard_page(request: Request) -> HTMLResponse:
+        if settings.dashboard_password is None:
+            return _no_store(HTMLResponse(render_login(enabled=False), status_code=503))
+        if _session_valid(settings.admin_key, request.cookies.get(SESSION_COOKIE)):
+            return _no_store(HTMLResponse(render_dashboard()))
+        return _no_store(HTMLResponse(render_login()))
+
+    @app.post("/dashboard/login", response_class=HTMLResponse)
+    def dashboard_login(password: Annotated[str, Form()] = "") -> Any:
+        if settings.dashboard_password is None:
+            return _no_store(HTMLResponse(render_login(enabled=False), status_code=503))
+        if not hmac.compare_digest(password, settings.dashboard_password):
+            return _no_store(
+                HTMLResponse(render_login("Wrong password."), status_code=401)
+            )
+        response = RedirectResponse("/dashboard", status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE,
+            _new_session(settings.admin_key),
+            max_age=SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
+
+    @app.post("/dashboard/logout")
+    def dashboard_logout() -> RedirectResponse:
+        response = RedirectResponse("/dashboard", status_code=303)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        return response
+
+    @app.get("/api/dashboard/drives", dependencies=[Depends(require_owner)])
+    def dashboard_drives() -> dict[str, Any]:
+        now = time.time()
+        return {
+            "online_window_seconds": ONLINE_WINDOW_SECONDS,
+            "drives": [_dashboard_drive(d, now) for d in db.list_drives()],
+        }
+
+    async def _save_upload(
+        drive_id: str, file: UploadFile, note: str | None
+    ) -> dict[str, Any]:
+        """Validate, store and queue one upload for a drive."""
+        owned_drive(drive_id)
+        try:
+            filename = sanitize_filename(file.filename or "")
+            check_allowed(filename, settings.blocked_extensions)
+            storage_key, size, sha256 = storage.save(
+                file.file, settings.max_file_bytes
+            )
+        except FileRejected as exc:
+            # 413 payload-too-large vs 415 blocked/missing name.
+            code = (
+                413
+                if "larger than" in str(exc)
+                else status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
+            )
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+        finally:
+            await file.close()
+
+        clean_note = (note or "").strip() or None
+        if clean_note and len(clean_note) > NOTE_MAX_LENGTH:
+            storage.delete(storage_key)
+            raise HTTPException(
+                status_code=422,
+                detail=f"Note is longer than {NOTE_MAX_LENGTH} characters.",
+            )
+
+        record = db.add_file(
+            uuid.uuid4().hex, drive_id, filename, size, sha256, clean_note, storage_key
+        )
+        return _file_public(record)
+
+    @app.post(
+        "/api/dashboard/drives/{drive_id}/files",
+        dependencies=[Depends(require_owner_action)],
+        status_code=201,
+    )
+    async def dashboard_upload_file(
+        drive_id: str,
+        file: UploadFile,
+        note: Annotated[str | None, Form()] = None,
+    ) -> dict[str, Any]:
+        return await _save_upload(drive_id, file, note)
+
+    @app.post(
+        "/api/dashboard/drives/{drive_id}/revoke",
+        dependencies=[Depends(require_owner_action)],
+    )
+    def dashboard_revoke_drive(drive_id: str) -> dict[str, Any]:
+        owned_drive(drive_id)
+        db.revoke_drive(drive_id)
+        return _drive_public(owned_drive(drive_id))
+
+    @app.post(
+        "/api/dashboard/drives/{drive_id}/rotate-token",
+        dependencies=[Depends(require_owner_action)],
+    )
+    def dashboard_rotate_token(drive_id: str) -> dict[str, Any]:
+        drive = owned_drive(drive_id)
+        if drive["revoked"]:
+            raise HTTPException(
+                status_code=409, detail="This drive has been revoked."
+            )
+        token = _new_token()
+        db.set_token_hash(drive_id, _hash_token(token))
+        return {**_drive_public(owned_drive(drive_id)), "token": token}
+
     # -- owner endpoints -----------------------------------------------
 
     @app.get("/api/health")
@@ -146,6 +358,15 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/drives/{drive_id}", dependencies=[Depends(require_admin)])
     def get_drive(drive_id: str) -> dict[str, Any]:
+        return _drive_public(owned_drive(drive_id))
+
+    @app.post(
+        "/api/drives/{drive_id}/installed", dependencies=[Depends(require_admin)]
+    )
+    def mark_drive_installed(drive_id: str) -> dict[str, Any]:
+        """Called by the owner CLI once the agent files are on the drive."""
+        owned_drive(drive_id)
+        db.mark_installed(drive_id)
         return _drive_public(owned_drive(drive_id))
 
     @app.post(
@@ -175,31 +396,7 @@ def create_app(settings: Settings) -> FastAPI:
         file: UploadFile,
         note: Annotated[str | None, Form()] = None,
     ) -> dict[str, Any]:
-        owned_drive(drive_id)
-        try:
-            filename = sanitize_filename(file.filename or "")
-            check_allowed(filename, settings.blocked_extensions)
-            storage_key, size, sha256 = storage.save(
-                file.file, settings.max_file_bytes
-            )
-        except FileRejected as exc:
-            # 413 payload-too-large vs 415 blocked/missing name.
-            code = 413 if "larger than" in str(exc) else status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
-            raise HTTPException(status_code=code, detail=str(exc)) from exc
-        finally:
-            await file.close()
-
-        clean_note = (note or "").strip() or None
-        if clean_note and len(clean_note) > NOTE_MAX_LENGTH:
-            storage.delete(storage_key)
-            raise HTTPException(
-                status_code=422, detail=f"Note is longer than {NOTE_MAX_LENGTH} characters."
-            )
-
-        record = db.add_file(
-            uuid.uuid4().hex, drive_id, filename, size, sha256, clean_note, storage_key
-        )
-        return _file_public(record)
+        return await _save_upload(drive_id, file, note)
 
     @app.get("/api/drives/{drive_id}/files", dependencies=[Depends(require_admin)])
     def list_drive_files(drive_id: str) -> list[dict[str, Any]]:
@@ -221,6 +418,8 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/api/agent/me")
     def agent_me(drive: dict[str, Any] = Depends(require_drive)) -> dict[str, Any]:
+        db.touch_drive(drive["id"])
+        db.mark_installed(drive["id"])
         return {
             "id": drive["id"],
             "name": drive["name"],
@@ -233,6 +432,7 @@ def create_app(settings: Settings) -> FastAPI:
         drive: dict[str, Any] = Depends(require_drive),
     ) -> dict[str, Any]:
         db.touch_drive(drive["id"])
+        db.mark_installed(drive["id"])
         files = db.pending_files(drive["id"], limit=QUEUE_LIMIT)
         return {"drive_id": drive["id"], "files": [_file_public(f) for f in files]}
 

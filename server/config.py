@@ -30,6 +30,7 @@ class Settings:
     admin_key: str
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
     blocked_extensions: frozenset[str] = field(default=BLOCKED_EXTENSIONS)
+    dashboard_password: str | None = None
 
     @property
     def db_path(self) -> Path:
@@ -51,6 +52,12 @@ class Settings:
         if len(admin_key) < 16:
             raise ConfigError("DC_ADMIN_KEY must be at least 16 characters long.")
 
+        dashboard_password = os.environ.get("DC_DASHBOARD_PASSWORD", "").strip() or None
+        if dashboard_password is not None and len(dashboard_password) < 16:
+            raise ConfigError(
+                "DC_DASHBOARD_PASSWORD must be at least 16 characters long."
+            )
+
         raw_size = os.environ.get("DC_MAX_FILE_BYTES", "").strip()
         max_file_bytes = DEFAULT_MAX_FILE_BYTES
         if raw_size:
@@ -65,4 +72,5 @@ class Settings:
             data_dir=Path(os.environ.get("DC_DATA_DIR", "./data")),
             admin_key=admin_key,
             max_file_bytes=max_file_bytes,
+            dashboard_password=dashboard_password,
         )
