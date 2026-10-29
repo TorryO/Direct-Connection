@@ -98,6 +98,13 @@ th {
 tbody tr + tr td { border-top: 1px solid var(--border); }
 td.num { font-variant-numeric: tabular-nums; }
 .drive-name { font-weight: 600; }
+.drive-name a { color: inherit; text-decoration: none; }
+.drive-name a:hover { text-decoration: underline; }
+.crumb { margin: 0 0 14px; font-size: 14px; }
+.crumb a { text-decoration: none; }
+.crumb a:hover { text-decoration: underline; }
+.file-name { font-weight: 600; overflow-wrap: anywhere; }
+.note { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
 .drive-id {
   color: var(--muted);
   font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -437,7 +444,43 @@ DASHBOARD_PAGE = Template(
     var send = button("Send", "primary small", submit);
     var cancel = button("Cancel", "small", closeModal);
 
-    function submit() {
+    function hex(buffer) {
+      return Array.prototype.map.call(new Uint8Array(buffer), function (byte) {
+        return byte.toString(16).padStart(2, "0");
+      }).join("");
+    }
+
+    async function uploadOne(file, noteValue) {
+      if (!window.crypto || !window.crypto.subtle) {
+        throw new Error("hashing needs HTTPS in this browser");
+      }
+      var sha256 = hex(await crypto.subtle.digest("SHA-256", await file.arrayBuffer()));
+      var intent = await fetch(
+        "/api/drives/" + encodeURIComponent(drive.id) + "/files/upload-url", {
+          method: "POST",
+          headers: { "X-Dashboard-Request": "1", "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: file.name, size: file.size, note: noteValue })
+        }).then(handle);
+
+      var put = await fetch(intent.upload_url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: file
+      });
+      if (!put.ok) {
+        throw new Error("storage rejected the upload (HTTP " + put.status + ")");
+      }
+
+      return fetch(
+        "/api/drives/" + encodeURIComponent(drive.id) + "/files/" +
+        encodeURIComponent(intent.id) + "/complete", {
+          method: "POST",
+          headers: { "X-Dashboard-Request": "1", "Content-Type": "application/json" },
+          body: JSON.stringify({ sha256: sha256 })
+        }).then(handle);
+    }
+
+    async function submit() {
       var files = fileInput.files ? Array.prototype.slice.call(fileInput.files) : [];
       if (!files.length) {
         results.textContent = "Choose at least one file.";
@@ -446,39 +489,28 @@ DASHBOARD_PAGE = Template(
       send.disabled = true;
       cancel.disabled = true;
       results.textContent = "";
-      var noteValue = note.value;
+      var noteValue = note.value.trim();
       var failures = 0;
 
-      function next() {
-        var file = files.shift();
-        if (!file) {
-          send.disabled = false;
-          cancel.disabled = false;
-          if (!failures) send.textContent = "Done";
-          load();
-          return;
-        }
+      for (var index = 0; index < files.length; index += 1) {
+        var file = files[index];
         var line = el("div", "result", file.name + " - uploading...");
         results.appendChild(line);
-        var form = new FormData();
-        form.append("file", file, file.name);
-        if (noteValue.trim()) form.append("note", noteValue);
-
-        fetch("/api/dashboard/drives/" + encodeURIComponent(drive.id) + "/files", {
-          method: "POST",
-          headers: HEADERS,
-          body: form
-        }).then(handle).then(function (record) {
+        try {
+          var record = await uploadOne(file, noteValue);
           line.className = "result ok";
           line.textContent = record.filename + " - queued (" + human(record.size) + ")";
-        }).catch(function (error) {
+        } catch (error) {
           failures += 1;
           line.className = "result bad";
           line.textContent = file.name + " - " + error.message;
-        }).then(next);
+        }
       }
 
-      next();
+      send.disabled = false;
+      cancel.disabled = false;
+      if (!failures) send.textContent = "Done";
+      load();
     }
 
     openModal([title, hint, fileInput, noteLabel, note, results,
@@ -579,7 +611,11 @@ DASHBOARD_PAGE = Template(
       var row = el("tr");
 
       var nameCell = el("td");
-      nameCell.appendChild(el("div", "drive-name", drive.name));
+      var nameWrap = el("div", "drive-name");
+      var link = el("a", null, drive.name);
+      link.href = "/dashboard/drives/" + encodeURIComponent(drive.id);
+      nameWrap.appendChild(link);
+      nameCell.appendChild(nameWrap);
       nameCell.appendChild(el("div", "drive-id", drive.id));
       row.appendChild(nameCell);
 
@@ -642,6 +678,204 @@ DASHBOARD_PAGE = Template(
 </html>
 """
 )
+
+
+DRIVE_PAGE = Template(
+    """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>$name - Direct-Connection</title>
+<style>$style</style>
+</head>
+<body>
+<header>
+  <h1>Direct-Connection<span class="who">drive detail</span></h1>
+  <form method="post" action="/dashboard/logout">
+    <button type="submit">Sign out</button>
+  </form>
+</header>
+<main id="drive" data-drive-id="$id">
+  <p class="crumb"><a href="/dashboard">&larr; All drives</a></p>
+  <h2>$name</h2>
+  <p class="sub"><span class="drive-id">$id</span></p>
+
+  <div class="cards">
+    <div class="card"><div class="label">Status</div><div class="value" id="status">&ndash;</div></div>
+    <div class="card"><div class="label">Program</div><div class="value" id="program">&ndash;</div></div>
+    <div class="card"><div class="label">Files</div><div class="value" id="file-count">&ndash;</div></div>
+    <div class="card"><div class="label">Pending</div><div class="value" id="pending">&ndash;</div></div>
+  </div>
+
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th>File</th>
+          <th>Size</th>
+          <th>Note</th>
+          <th>Status</th>
+          <th>Queued</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="file-rows">
+        <tr><td colspan="6" class="empty">Loading&hellip;</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <footer id="updated"></footer>
+</main>
+<script>
+(function () {
+  var main = document.getElementById("drive");
+  var driveId = main.dataset.driveId;
+  var rows = document.getElementById("file-rows");
+  var REFRESH_MS = 15000;
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+
+  function human(size) {
+    var value = Number(size) || 0;
+    var units = ["B", "KiB", "MiB", "GiB"];
+    var unit = 0;
+    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+    return (unit === 0 ? value.toFixed(0) : value.toFixed(1)) + " " + units[unit];
+  }
+
+  function relative(iso) {
+    if (!iso) return "never";
+    var then = new Date(iso).getTime();
+    if (isNaN(then)) return iso;
+    var seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (seconds < 45) return "just now";
+    var minutes = Math.round(seconds / 60);
+    if (minutes < 60) return minutes + (minutes === 1 ? " min ago" : " mins ago");
+    var hours = Math.round(minutes / 60);
+    if (hours < 24) return hours + (hours === 1 ? " hour ago" : " hours ago");
+    var days = Math.round(hours / 24);
+    if (days < 30) return days + (days === 1 ? " day ago" : " days ago");
+    return new Date(iso).toLocaleDateString();
+  }
+
+  function badge(kind, text, dot) {
+    var span = el("span", "badge " + kind);
+    if (dot !== false) span.appendChild(el("span", "dot"));
+    span.appendChild(document.createTextNode(text));
+    return span;
+  }
+
+  function removeFile(file) {
+    if (!window.confirm("Remove " + file.filename + "? The stored bytes are deleted too.")) {
+      return;
+    }
+    fetch("/api/dashboard/drives/" + encodeURIComponent(driveId) + "/files/" +
+          encodeURIComponent(file.id), {
+      method: "DELETE",
+      headers: { "X-Dashboard-Request": "1", "Accept": "application/json" }
+    }).then(function (response) {
+      if (response.status === 401) { window.location = "/dashboard"; return; }
+      return response.json().catch(function () { return {}; }).then(function (payload) {
+        if (!response.ok) throw new Error(payload.detail || ("HTTP " + response.status));
+        load();
+      });
+    }).catch(function (error) {
+      document.getElementById("updated").textContent = "Could not remove: " + error.message;
+    });
+  }
+
+  function render(drive) {
+    var status = document.getElementById("status");
+    status.textContent = "";
+    if (drive.revoked) status.appendChild(badge("revoked", "Revoked"));
+    else if (drive.online) status.appendChild(badge("online", "Online"));
+    else status.appendChild(badge("offline", "Offline"));
+
+    document.getElementById("program").textContent = drive.installed ? "Installed" : "Not installed";
+
+    var files = drive.files || [];
+    var pending = files.filter(function (f) { return !f.delivered_at; }).length;
+    document.getElementById("file-count").textContent = String(files.length);
+    document.getElementById("pending").textContent = String(pending);
+
+    rows.textContent = "";
+    if (!files.length) {
+      var emptyRow = el("tr");
+      var emptyCell = el("td", "empty", "No files queued for this drive yet.");
+      emptyCell.colSpan = 6;
+      emptyRow.appendChild(emptyCell);
+      rows.appendChild(emptyRow);
+    }
+
+    files.forEach(function (file) {
+      var row = el("tr");
+      row.appendChild(el("td", "file-name", file.filename));
+      row.appendChild(el("td", "num", human(file.size)));
+      row.appendChild(el("td", "note", file.note || ""));
+
+      var statusCell = el("td");
+      if (file.delivered_at) {
+        statusCell.appendChild(badge("online", "Delivered " + relative(file.delivered_at), false));
+      } else {
+        statusCell.appendChild(badge("pending-install", "Pending", false));
+      }
+      row.appendChild(statusCell);
+
+      row.appendChild(el("td", "muted", relative(file.created_at)));
+
+      var actionCell = el("td", "actions");
+      var remove = el("button", "small danger", "Remove");
+      remove.type = "button";
+      remove.addEventListener("click", function () { removeFile(file); });
+      actionCell.appendChild(remove);
+      row.appendChild(actionCell);
+      rows.appendChild(row);
+    });
+
+    document.getElementById("updated").textContent =
+      "Last updated " + new Date().toLocaleTimeString();
+  }
+
+  function load() {
+    fetch("/api/dashboard/drives/" + encodeURIComponent(driveId),
+          { headers: { "Accept": "application/json" } })
+      .then(function (response) {
+        if (response.status === 401) { window.location = "/dashboard"; throw new Error("signed out"); }
+        if (response.status === 404) { window.location = "/dashboard"; throw new Error("gone"); }
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        return response.json();
+      })
+      .then(render)
+      .catch(function (error) {
+        if (error.message !== "signed out" && error.message !== "gone") {
+          document.getElementById("updated").textContent = "Could not refresh: " + error.message;
+        }
+      });
+  }
+
+  load();
+  setInterval(load, REFRESH_MS);
+})();
+</script>
+</body>
+</html>
+"""
+)
+
+
+def render_drive(drive: dict) -> str:
+    return DRIVE_PAGE.substitute(
+        style=STYLE,
+        name=escape(str(drive["name"])),
+        id=escape(str(drive["id"])),
+    )
 
 
 def render_login(error: str | None = None, *, enabled: bool = True) -> str:

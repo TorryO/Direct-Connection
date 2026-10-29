@@ -68,7 +68,13 @@ Server environment variables:
 | --- | --- | --- |
 | `DC_ADMIN_KEY` | *(required, 16+ chars)* | Owner key for the CLI and owner endpoints |
 | `DC_DASHBOARD_PASSWORD` | *(unset = dashboard disabled)* | Password for the owner web dashboard at `/dashboard` |
-| `DC_DATA_DIR` | `./data` | SQLite database and uploaded files |
+| `DC_DATA_DIR` | `./data` | SQLite database and uploaded files when the two settings below are unset |
+| `DC_DATABASE_URL` | *(unset = SQLite)* | `postgres://` or `postgresql://` URL; required on Vercel |
+| `DC_S3_BUCKET` | *(unset = local disk)* | S3-compatible bucket for file bytes; required on Vercel |
+| `DC_S3_ENDPOINT_URL` | *(AWS default)* | e.g. `https://<account>.r2.cloudflarestorage.com` |
+| `DC_S3_REGION` | `auto` | Bucket region |
+| `DC_S3_ACCESS_KEY_ID` / `DC_S3_SECRET_ACCESS_KEY` | *(required with the bucket)* | Credentials that can presign PUT/GET on the bucket |
+| `DC_S3_PREFIX` | *(empty)* | Optional key prefix, e.g. `direct-connection` |
 | `DC_HOST` / `DC_PORT` | `127.0.0.1` / `8000` | Listen address. Put it behind HTTPS before exposing it |
 | `DC_MAX_FILE_BYTES` | `52428800` (50 MiB) | Per-file upload limit |
 
@@ -83,6 +89,8 @@ and you get one row per flash drive:
   time, so you can tell which sticks actually carry the program.
 - Pending file count, when the drive was added, and a running total of drives, online drives,
   installed drives and queued files.
+- **Drive detail**: click a drive name for its files with size, note, queued time and delivery
+  receipt, plus a Remove button that deletes the queued file and its stored bytes.
 - **Actions** per drive: **Send** queues one or more files with an optional note (same size,
   type and hashing rules as the CLI), **Revoke** disables the drive for good after a confirmation,
   and **Rotate** issues a new token and shows it once for you to update the drive. Revoked
@@ -96,6 +104,54 @@ with your session cookie; scripts using `X-Admin-Key` do not need it.
 
 Put the server behind HTTPS before exposing it, since the password and session cookie travel
 with every request.
+
+## Deploy on Vercel
+
+Vercel Functions have an ephemeral filesystem and a 4.5 MB request/response
+limit, so this app switches to Postgres plus S3-compatible object storage and
+hands out short-lived URLs instead of moving bytes through the function.
+`main.py` exports the FastAPI app, `vercel.json` sets a 60s function limit.
+
+1. Create a Postgres database (Neon, Supabase, Vercel's Postgres integration)
+   and an S3-compatible bucket (Cloudflare R2, Supabase Storage, AWS S3, MinIO).
+2. Allow browser uploads to the bucket from your dashboard origin. For S3/R2:
+
+   ```json
+   [{
+     "AllowedOrigins": ["https://your-app.vercel.app"],
+     "AllowedMethods": ["PUT"],
+     "AllowedHeaders": ["content-type"],
+     "MaxAgeSeconds": 3000
+   }]
+   ```
+
+3. Import the repo into Vercel (framework preset: FastAPI) and set:
+
+   | Variable | Value |
+   | --- | --- |
+   | `DC_ADMIN_KEY` | random, 16+ chars |
+   | `DC_DASHBOARD_PASSWORD` | random, 16+ chars |
+   | `DC_DATABASE_URL` | your Postgres URL (add `?sslmode=require` if needed) |
+   | `DC_S3_BUCKET` / `DC_S3_ACCESS_KEY_ID` / `DC_S3_SECRET_ACCESS_KEY` | bucket details |
+   | `DC_S3_ENDPOINT_URL`, `DC_S3_REGION` | for R2/Supabase/MinIO |
+
+4. Deploy with the dashboard (`vercel --prod`) or by pushing a branch. Once the
+   deployment is live, open `/dashboard` and sign in.
+
+Nothing needs a build command and no local files are written. The schema is
+created on first connection, and uploads (`dc.py send` and the dashboard) go
+straight to the bucket, so the 4.5 MB function limit does not apply. The agent
+fetches a short-lived download link and saves to `Inbox/` as before.
+
+Notes:
+
+- Vercel's Postgres integration works for `DC_DATABASE_URL`. Vercel Blob is
+  not S3-compatible, so use an S3-compatible bucket for the file bytes.
+- Presigned links last 15 minutes. If a drive's clock is badly wrong, downloads
+  fail until it is corrected.
+- `DC_DATA_DIR` is ignored once `DC_DATABASE_URL` and `DC_S3_BUCKET` are set.
+- Cold starts create one database round trip and one S3 client; requests after
+  that reuse them per instance.
 
 ## Owner workflow
 
@@ -146,7 +202,10 @@ Owner endpoints require the `X-Admin-Key` header. Agent endpoints require
 | `POST` | `/api/drives` | owner | Register a drive, returns its token once |
 | `GET` | `/api/drives` | owner | List drives with pending counts |
 | `GET` | `/api/drives/{id}` | owner | One drive |
-| `POST` | `/api/drives/{id}/files` | owner | Upload (`file` part, optional `note` form field) |
+| `POST` | `/api/drives/{id}/files` | owner | Upload in one request (`file` part, optional `note`); local/small files |
+| `POST` | `/api/drives/{id}/files/upload-url` | owner | Reserve a file, get a presigned upload URL |
+| `POST` | `/api/drives/{id}/files/{file_id}/complete` | owner | Confirm the upload with its `sha256` |
+| `PUT` / `GET` | `/api/blob/upload/{key}` / `/api/blob/download/{key}` | signed URL | Local-storage upload/download |
 | `GET` | `/api/drives/{id}/files` | owner | Queue with `delivered_at` receipts |
 | `DELETE` | `/api/drives/{id}/files/{file_id}` | owner | Remove a file and its bytes |
 | `POST` | `/api/drives/{id}/installed` | owner | Record that the agent files were written to the drive |
@@ -154,14 +213,18 @@ Owner endpoints require the `X-Admin-Key` header. Agent endpoints require
 | `POST` | `/api/drives/{id}/rotate-token` | owner | Issue a new token, invalidating the old one |
 | `GET` | `/api/agent/me` | agent | Drive name, used by the first-run screen |
 | `GET` | `/api/agent/queue` | agent | Pending files (id, name, size, sha256, note) |
-| `GET` | `/api/agent/files/{file_id}` | agent | Download; `X-Content-Sha256` header |
+| `GET` | `/api/agent/files/{file_id}/link` | agent | Short-lived download URL plus `sha256` |
+| `GET` | `/api/agent/files/{file_id}` | agent | Download; `X-Content-Sha256` header (local disk, or redirect to storage) |
 | `POST` | `/api/agent/files/{file_id}/ack` | agent | Confirm delivery with the `sha256` form field |
 | `GET` | `/api/health` | anyone | Liveness probe |
 | `GET` | `/api/dashboard/drives` | owner | Overview rows with `online` / `installed` state |
+| `GET` | `/api/dashboard/drives/{id}` | owner | Drive detail with its files and receipts |
+| `DELETE` | `/api/dashboard/drives/{id}/files/{file_id}` | owner | Remove a file and its stored bytes |
 | `POST` | `/api/dashboard/drives/{id}/files` | owner | Upload from the dashboard (session) |
 | `POST` | `/api/dashboard/drives/{id}/revoke` | owner | Revoke from the dashboard (session) |
 | `POST` | `/api/dashboard/drives/{id}/rotate-token` | owner | Rotate from the dashboard (session) |
 | `GET` | `/dashboard` | owner | Login page, or the drive overview with a session |
+| `GET` | `/dashboard/drives/{id}` | owner | Drive detail page |
 
 Interactive docs are at `/docs` while the server runs.
 
@@ -169,15 +232,17 @@ Interactive docs are at `/docs` while the server runs.
 
 ```
 Direct-Connection/
-  server/            # FastAPI app, SQLite store, local-disk storage
-    app.py           # routes and auth dependencies
-    db.py            # drives + files tables
-    storage.py       # sanitizing, size limits, hashing, atomic writes
+  main.py            # Vercel entrypoint (exports the FastAPI app)
+  vercel.json        # function duration
+  server/            # FastAPI app, SQLite or Postgres, local disk or S3
+    app.py           # routes, auth dependencies and signed-URL endpoints
+    db.py            # drives + files tables, SQLite and Postgres backends
+    storage.py       # local/S3 storage, sanitizing, limits, hashing
     config.py        # environment-driven settings
-    dashboard.py     # owner login page and drive overview (HTML + vanilla JS)
+    dashboard.py     # login, drive overview and drive detail (HTML + vanilla JS)
   owner-cli/dc.py    # owner tool (stdlib only)
   agent/agent.py     # portable agent for the drive (stdlib + tkinter)
-  tests/             # API and end-to-end agent tests
+  tests/             # API, upload-flow, storage, Postgres and agent tests
   requirements.txt
 ```
 
@@ -191,9 +256,19 @@ Direct-Connection/
 The agent tests start a real uvicorn server and run the agent against it, including corrupted
 downloads, blocked file types, name collisions and revocation.
 
+The Postgres backend is tested against a real database when you provide one:
+
+```bash
+docker run --rm -d --name dc-pg -p 55432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
+DC_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/postgres \
+  .venv/bin/python -m pytest tests/test_postgres.py -q
+docker rm -f dc-pg
+```
+
 ## Roadmap
 
-- Owner web dashboard: login, overview and per-drive actions (send, revoke, rotate) are done
+- Owner web dashboard: login, overview, drive detail and per-drive actions are done
+- Serverless storage: Postgres and S3 backends are done; retention rules and quotas are not
 - Optional end-to-end encryption of files
 - Auto-update for the agent
 - Windows, macOS and Linux builds of the agent (PyInstaller)

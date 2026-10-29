@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import secrets
 import time
 import uuid
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -23,9 +25,16 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
-from .dashboard import render_dashboard, render_login
-from .db import Database
-from .storage import FileRejected, FileStorage, check_allowed, sanitize_filename
+from .dashboard import render_dashboard, render_drive, render_login
+from .db import open_database
+from .storage import (
+    URL_TTL_SECONDS,
+    FileRejected,
+    LocalStorage,
+    check_allowed,
+    open_storage,
+    sanitize_filename,
+)
 
 NOTE_MAX_LENGTH = 2000
 QUEUE_LIMIT = 100
@@ -37,9 +46,28 @@ ONLINE_WINDOW_SECONDS = 90
 SESSION_COOKIE = "dc_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 
+_STORAGE_KEY = re.compile(r"^[0-9a-f]{32}$")
+
 
 class DriveCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+
+
+class UploadIntent(BaseModel):
+    filename: str = Field(min_length=1, max_length=400)
+    size: int = Field(gt=0)
+    note: str | None = None
+
+
+class UploadComplete(BaseModel):
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+
+
+def _cookie_secure(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    return forwarded == "https"
 
 
 def _iso(ts: float | None) -> str | None:
@@ -121,8 +149,8 @@ def _file_public(file: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_app(settings: Settings) -> FastAPI:
-    db = Database(settings.db_path)
-    storage = FileStorage(settings.files_dir)
+    db = open_database(settings.db_path, settings.database_url)
+    storage = open_storage(settings)
 
     app = FastAPI(
         title="Direct-Connection",
@@ -217,6 +245,50 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=404, detail="Drive not found.")
         return drive
 
+    # -- signed blob endpoints (local storage only) ----------------------
+
+    def _local_storage() -> LocalStorage | None:
+        return storage if isinstance(storage, LocalStorage) else None
+
+    @app.put("/api/blob/upload/{key}")
+    async def blob_upload(
+        key: str,
+        request: Request,
+        expires: int = 0,
+        signature: str = "",
+    ) -> dict[str, Any]:
+        local = _local_storage()
+        if local is None or not _STORAGE_KEY.match(key):
+            raise HTTPException(status_code=404, detail="Not found.")
+        if not local.verify("upload", key, expires, signature):
+            raise HTTPException(status_code=403, detail="Upload link is invalid or expired.")
+        raw_length = request.headers.get("content-length")
+        if raw_length and raw_length.isdigit() and int(raw_length) > settings.max_file_bytes:
+            raise HTTPException(status_code=413, detail="File is larger than the limit.")
+        body = await request.body()
+        try:
+            size, sha256 = local.save_at(key, BytesIO(body), settings.max_file_bytes)
+        except FileRejected as exc:
+            code = 413 if "larger than" in str(exc) else 415
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+        return {"size": size, "sha256": sha256}
+
+    @app.get("/api/blob/download/{key}")
+    def blob_download(key: str, expires: int = 0, signature: str = "") -> FileResponse:
+        local = _local_storage()
+        if local is None or not _STORAGE_KEY.match(key):
+            raise HTTPException(status_code=404, detail="Not found.")
+        if not local.verify("download", key, expires, signature):
+            raise HTTPException(status_code=403, detail="Download link is invalid or expired.")
+        path = local.path_for(key)
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="Stored file is missing.")
+        return FileResponse(
+            path,
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store"},
+        )
+
     # -- dashboard -------------------------------------------------------
 
     def _no_store(response: HTMLResponse) -> HTMLResponse:
@@ -234,7 +306,9 @@ def create_app(settings: Settings) -> FastAPI:
         return _no_store(HTMLResponse(render_login()))
 
     @app.post("/dashboard/login", response_class=HTMLResponse)
-    def dashboard_login(password: Annotated[str, Form()] = "") -> Any:
+    def dashboard_login(
+        request: Request, password: Annotated[str, Form()] = ""
+    ) -> Any:
         if settings.dashboard_password is None:
             return _no_store(HTMLResponse(render_login(enabled=False), status_code=503))
         if not hmac.compare_digest(password, settings.dashboard_password):
@@ -248,6 +322,7 @@ def create_app(settings: Settings) -> FastAPI:
             max_age=SESSION_TTL_SECONDS,
             httponly=True,
             samesite="lax",
+            secure=_cookie_secure(request),
             path="/",
         )
         return response
@@ -265,6 +340,43 @@ def create_app(settings: Settings) -> FastAPI:
             "online_window_seconds": ONLINE_WINDOW_SECONDS,
             "drives": [_dashboard_drive(d, now) for d in db.list_drives()],
         }
+
+    @app.get("/dashboard/drives/{drive_id}", response_class=HTMLResponse)
+    def dashboard_drive_page(drive_id: str, request: Request) -> Any:
+        if settings.dashboard_password is None:
+            return _no_store(HTMLResponse(render_login(enabled=False), status_code=503))
+        if not _session_valid(settings.admin_key, request.cookies.get(SESSION_COOKIE)):
+            return RedirectResponse("/dashboard", status_code=303)
+        drive = db.get_drive(drive_id)
+        if drive is None:
+            return _no_store(
+                HTMLResponse("<h1>Drive not found</h1><p><a href='/dashboard'>Back</a></p>",
+                             status_code=404)
+            )
+        return _no_store(HTMLResponse(render_drive(drive)))
+
+    @app.get("/api/dashboard/drives/{drive_id}", dependencies=[Depends(require_owner)])
+    def dashboard_drive(drive_id: str) -> dict[str, Any]:
+        drive = owned_drive(drive_id)
+        return {
+            **_dashboard_drive(drive, time.time()),
+            "files": [_file_public(f) for f in db.list_files(drive_id)],
+        }
+
+    def _delete_file(drive_id: str, file_id: str) -> dict[str, bool]:
+        file = db.get_file(file_id)
+        if file is None or file["drive_id"] != drive_id:
+            raise HTTPException(status_code=404, detail="File not found.")
+        storage.delete(file["storage_key"])
+        db.delete_file(file_id)
+        return {"deleted": True}
+
+    @app.delete(
+        "/api/dashboard/drives/{drive_id}/files/{file_id}",
+        dependencies=[Depends(require_owner_action)],
+    )
+    def dashboard_delete_file(drive_id: str, file_id: str) -> dict[str, bool]:
+        return _delete_file(drive_id, file_id)
 
     async def _save_upload(
         drive_id: str, file: UploadFile, note: str | None
@@ -407,12 +519,93 @@ def create_app(settings: Settings) -> FastAPI:
         "/api/drives/{drive_id}/files/{file_id}", dependencies=[Depends(require_admin)]
     )
     def delete_drive_file(drive_id: str, file_id: str) -> dict[str, bool]:
+        return _delete_file(drive_id, file_id)
+
+    @app.post(
+        "/api/drives/{drive_id}/files/upload-url",
+        dependencies=[Depends(require_owner_action)],
+        status_code=201,
+    )
+    def create_upload_url(
+        drive_id: str, payload: UploadIntent
+    ) -> dict[str, Any]:
+        """Reserve a file and return a short-lived URL the client uploads to.
+
+        Bytes go straight to storage, so uploads are not capped by the API's
+        request-size limit (Vercel Functions stop at 4.5 MB).
+        """
+        owned_drive(drive_id)
+        try:
+            filename = sanitize_filename(payload.filename)
+            check_allowed(filename, settings.blocked_extensions)
+        except FileRejected as exc:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc)
+            ) from exc
+        if payload.size > settings.max_file_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File is larger than the {settings.max_file_bytes} byte limit.",
+            )
+        clean_note = (payload.note or "").strip() or None
+        if clean_note and len(clean_note) > NOTE_MAX_LENGTH:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Note is longer than {NOTE_MAX_LENGTH} characters.",
+            )
+
+        storage_key = uuid.uuid4().hex
+        record = db.create_upload_intent(
+            uuid.uuid4().hex,
+            drive_id,
+            filename,
+            payload.size,
+            clean_note,
+            storage_key,
+        )
+        return {
+            "id": record["id"],
+            "filename": filename,
+            "size": payload.size,
+            "upload_url": storage.upload_url(storage_key),
+            "expires_in": URL_TTL_SECONDS,
+        }
+
+    @app.post(
+        "/api/drives/{drive_id}/files/{file_id}/complete",
+        dependencies=[Depends(require_owner_action)],
+    )
+    def complete_upload(
+        drive_id: str, file_id: str, payload: UploadComplete
+    ) -> dict[str, Any]:
+        owned_drive(drive_id)
         file = db.get_file(file_id)
         if file is None or file["drive_id"] != drive_id:
             raise HTTPException(status_code=404, detail="File not found.")
-        storage.delete(file["storage_key"])
-        db.delete_file(file_id)
-        return {"deleted": True}
+        if file.get("uploaded_at") is not None:
+            return _file_public(file)
+
+        try:
+            exists, stored_size = storage.head(file["storage_key"])
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Storage error: {exc}"
+            ) from exc
+        if not exists:
+            db.delete_file(file_id)
+            raise HTTPException(
+                status_code=409, detail="Upload not found in storage; request a new URL."
+            )
+        if stored_size != file["size"]:
+            storage.delete(file["storage_key"])
+            db.delete_file(file_id)
+            raise HTTPException(
+                status_code=422,
+                detail=f"Uploaded {stored_size} bytes but {file['size']} were expected.",
+            )
+
+        db.mark_uploaded(file_id, payload.sha256.lower())
+        return _file_public(db.get_file(file_id) or file)
 
     # -- agent endpoints -----------------------------------------------
 
@@ -436,15 +629,43 @@ def create_app(settings: Settings) -> FastAPI:
         files = db.pending_files(drive["id"], limit=QUEUE_LIMIT)
         return {"drive_id": drive["id"], "files": [_file_public(f) for f in files]}
 
+    @app.get("/api/agent/files/{file_id}/link")
+    def agent_file_link(
+        file_id: str,
+        drive: dict[str, Any] = Depends(require_drive),
+    ) -> dict[str, Any]:
+        """A short-lived URL the agent downloads from without credentials."""
+        file = db.get_file(file_id)
+        if file is None or file["drive_id"] != drive["id"]:
+            raise HTTPException(status_code=404, detail="File not found.")
+        if file.get("uploaded_at") is None:
+            raise HTTPException(status_code=409, detail="Upload is not complete yet.")
+        return {
+            "id": file["id"],
+            "filename": file["filename"],
+            "size": file["size"],
+            "sha256": file["sha256"],
+            "url": storage.download_url(file["storage_key"]),
+            "expires_in": URL_TTL_SECONDS,
+        }
+
     @app.get("/api/agent/files/{file_id}")
     def agent_download(
         file_id: str,
         request: Request,
         drive: dict[str, Any] = Depends(require_drive),
-    ) -> FileResponse:
+    ) -> Any:
         file = db.get_file(file_id)
         if file is None or file["drive_id"] != drive["id"]:
             raise HTTPException(status_code=404, detail="File not found.")
+        if file.get("uploaded_at") is None:
+            raise HTTPException(status_code=409, detail="Upload is not complete yet.")
+        if not isinstance(storage, LocalStorage):
+            return RedirectResponse(
+                storage.download_url(file["storage_key"]),
+                status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+                headers={"Cache-Control": "no-store"},
+            )
         path = storage.path_for(file["storage_key"])
         if not path.is_file():
             raise HTTPException(status_code=410, detail="Stored file is missing.")

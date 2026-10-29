@@ -316,6 +316,91 @@ def test_dashboard_actions_work_with_the_admin_key(client, admin_headers):
     ).status_code == 200
 
 
+# -- drive detail page ----------------------------------------------------
+
+
+def test_detail_page_requires_a_session(client, admin_headers):
+    drive = create_drive(client, admin_headers)
+    response = client.get(f"/dashboard/drives/{drive['id']}", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/dashboard"
+
+
+def test_detail_page_and_api_show_queued_files(client, admin_headers, app):
+    drive = create_drive(client, admin_headers)
+    assert client.post(
+        f"/api/drives/{drive['id']}/files",
+        headers=admin_headers,
+        files={"file": ("detail.txt", b"bytes", "text/plain")},
+    ).status_code == 201
+    login(client)
+
+    page = client.get(f"/dashboard/drives/{drive['id']}")
+    assert page.status_code == 200
+    assert "drive detail" in page.text
+    assert f'data-drive-id="{drive["id"]}"' in page.text
+
+    body = client.get(f"/api/dashboard/drives/{drive['id']}").json()
+    assert body["id"] == drive["id"]
+    assert [f["filename"] for f in body["files"]] == ["detail.txt"]
+    assert body["files"][0]["delivered_at"] is None
+
+    client.get(
+        "/api/agent/queue", headers={"Authorization": f"Bearer {drive['token']}"}
+    )
+    record = body["files"][0]
+    client.post(
+        f"/api/agent/files/{record['id']}/ack",
+        headers={"Authorization": f"Bearer {drive['token']}"},
+        data={"sha256": record["sha256"]},
+    )
+    refreshed = client.get(f"/api/dashboard/drives/{drive['id']}").json()
+    assert refreshed["files"][0]["delivered_at"] is not None
+
+
+def test_detail_page_404_for_unknown_drive(client, admin_headers):
+    login(client)
+    assert client.get("/dashboard/drives/nope").status_code == 404
+    assert client.get("/api/dashboard/drives/nope").status_code == 404
+
+
+def test_removing_a_file_from_the_detail_page(client, admin_headers, settings):
+    drive = create_drive(client, admin_headers)
+    record = client.post(
+        f"/api/drives/{drive['id']}/files",
+        headers=admin_headers,
+        files={"file": ("junk.txt", b"junk", "text/plain")},
+    ).json()
+    login(client)
+
+    url = f"/api/dashboard/drives/{drive['id']}/files/{record['id']}"
+    # The CSRF header is required for cookie-authenticated deletes.
+    assert client.delete(url).status_code == 403
+    assert list(settings.files_dir.iterdir()) != []
+
+    deleted = client.delete(url, headers=ACTION_HEADERS)
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True}
+    assert list(settings.files_dir.iterdir()) == []
+    assert client.get(f"/api/dashboard/drives/{drive['id']}").json()["files"] == []
+
+
+def test_wrong_drive_cannot_delete_another_drives_file(client, admin_headers):
+    first = create_drive(client, admin_headers, "one")
+    second = create_drive(client, admin_headers, "two")
+    record = client.post(
+        f"/api/drives/{first['id']}/files",
+        headers=admin_headers,
+        files={"file": ("private.txt", b"x", "text/plain")},
+    ).json()
+    login(client)
+    response = client.delete(
+        f"/api/dashboard/drives/{second['id']}/files/{record['id']}",
+        headers=ACTION_HEADERS,
+    )
+    assert response.status_code == 404
+
+
 # -- storage -------------------------------------------------------------
 
 

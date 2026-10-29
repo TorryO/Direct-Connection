@@ -31,6 +31,16 @@ class Settings:
     max_file_bytes: int = DEFAULT_MAX_FILE_BYTES
     blocked_extensions: frozenset[str] = field(default=BLOCKED_EXTENSIONS)
     dashboard_password: str | None = None
+    # Postgres DSN. When unset the server uses SQLite under data_dir.
+    database_url: str | None = None
+    # S3-compatible object storage. When bucket is set, files live there
+    # instead of under data_dir/files.
+    s3_bucket: str | None = None
+    s3_endpoint_url: str | None = None
+    s3_region: str = "auto"
+    s3_access_key_id: str | None = None
+    s3_secret_access_key: str | None = None
+    s3_prefix: str = ""
 
     @property
     def db_path(self) -> Path:
@@ -39,6 +49,10 @@ class Settings:
     @property
     def files_dir(self) -> Path:
         return self.data_dir / "files"
+
+    @property
+    def uses_object_storage(self) -> bool:
+        return bool(self.s3_bucket)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -58,6 +72,22 @@ class Settings:
                 "DC_DASHBOARD_PASSWORD must be at least 16 characters long."
             )
 
+        database_url = os.environ.get("DC_DATABASE_URL", "").strip() or None
+        if database_url and not database_url.startswith(
+            ("postgres://", "postgresql://")
+        ):
+            raise ConfigError("DC_DATABASE_URL must be a postgres:// or postgresql:// URL.")
+
+        s3_bucket = os.environ.get("DC_S3_BUCKET", "").strip() or None
+        s3_access_key_id = os.environ.get("DC_S3_ACCESS_KEY_ID", "").strip() or None
+        s3_secret_access_key = (
+            os.environ.get("DC_S3_SECRET_ACCESS_KEY", "").strip() or None
+        )
+        if s3_bucket and not (s3_access_key_id and s3_secret_access_key):
+            raise ConfigError(
+                "DC_S3_BUCKET needs DC_S3_ACCESS_KEY_ID and DC_S3_SECRET_ACCESS_KEY."
+            )
+
         raw_size = os.environ.get("DC_MAX_FILE_BYTES", "").strip()
         max_file_bytes = DEFAULT_MAX_FILE_BYTES
         if raw_size:
@@ -73,4 +103,11 @@ class Settings:
             admin_key=admin_key,
             max_file_bytes=max_file_bytes,
             dashboard_password=dashboard_password,
+            database_url=database_url,
+            s3_bucket=s3_bucket,
+            s3_endpoint_url=os.environ.get("DC_S3_ENDPOINT_URL", "").strip() or None,
+            s3_region=os.environ.get("DC_S3_REGION", "").strip() or "auto",
+            s3_access_key_id=s3_access_key_id,
+            s3_secret_access_key=s3_secret_access_key,
+            s3_prefix=os.environ.get("DC_S3_PREFIX", "").strip().strip("/"),
         )
