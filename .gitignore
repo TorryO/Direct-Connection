@@ -1,0 +1,14 @@
+# Server data (SQLite database and uploaded files)
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Per-drive agent configs (contain tokens — never commit these)
+direct-connection.json

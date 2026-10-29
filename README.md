@@ -1,81 +1,166 @@
 # Direct-Connection
-This allows the owner of the flash to remotely upload content into the flash once connected to a device with internet access.
-Send files to a USB flash drive **after you have handed it to someone else**. When the drive is plugged into any computer with internet, the owner can push new content to it remotely.
 
-Think of it as "Dropbox for a flash drive": the owner uploads files online, and the drive pulls them down the next time the person it was given to opens it.
-
-## How it works
+This allows the owner of a USB flash drive to send files to it **after handing it to someone else**.
+When the drive is plugged into any computer with internet, its agent pulls down whatever the owner
+queued. Think of it as "Dropbox for a flash drive".
 
 ```
-Owner (web dashboard / CLI)
-        |  uploads files for Drive #ID
-        v
-Server (API + file storage)
-        ^  drive checks for new files over HTTPS
-        |
-Drive Agent (portable app stored ON the flash drive)
-        |  downloads files into the drive's Inbox/ folder
-        v
-Flash drive  ->  recipient opens Inbox/ and sees the new content
+Owner (CLI)                Server (API + disk)              Drive Agent (portable app ON the drive)
+  send files  ----------->  per-drive queue, SHA-256  <----  polls over HTTPS, downloads,
+                            storage, delivery receipts       verifies hash, saves to Inbox/
 ```
 
-1. **Owner dashboard**: log in, pick a drive, upload files or write a note.
-2. **Server**: stores uploads and a per-drive queue of "pending files".
-3. **Drive Agent**: a small portable program kept on the flash drive. The recipient starts it, it checks the server, and it downloads anything new into the drive.
+1. The owner registers a drive and gets a token for it.
+2. The owner queues files for that drive with the CLI.
+3. The recipient plugs the drive in and starts the agent themselves.
+4. The agent downloads anything pending into `Inbox/`, verifies each SHA-256, and reports delivery.
 
-## Trust and safety rules (non-negotiable)
+## Status: MVP 0.1
 
-This tool writes to someone else's computer session, so it must be transparent and harmless by design:
+- [x] Server API: register drive, upload file for a drive, list pending files, download file
+- [x] Owner CLI to upload files to a drive ID
+- [x] Drive Agent: check for new files, download to `Inbox/`, verify hash, show log
+- [x] Per-drive token authentication (token stored as a SHA-256 hash, revocable, rotatable)
+- [x] Basic file size and type limits
+- [x] Delivery receipts (the owner sees when a file arrived)
 
-- **No autorun.** The agent only runs when the recipient opens it themselves.
-- **Visible at all times.** It shows a window or tray icon with a live activity log, plus Pause and Quit buttons.
-- **Writes only inside the drive's `Inbox/` folder.** It never touches the host computer's files, settings, or startup items.
-- **Never executes what it downloads.** No `.exe`, scripts, or installers are run. Executable file types can be blocked entirely.
-- **Integrity checks.** Every file is verified with a SHA-256 hash before being saved.
-- **Revocable.** Each drive has its own token that the owner can disable at any time.
-- **Recipient-friendly.** The first-run screen explains what the drive does and who the owner is.
+See [Roadmap](#roadmap) for what is not built yet.
 
-## MVP scope (version 0.1)
+## Trust and safety rules
 
-- [ ] Server API: register drive, upload file for a drive, list pending files, download file
-- [ ] Owner CLI or simple web page to upload files to a drive ID
-- [ ] Drive Agent: check for new files, download to `Inbox/`, verify hash, show log
-- [ ] Per-drive token authentication over HTTPS
-- [ ] Basic file size and type limits
+The agent writes into someone else's session, so it is deliberately boring and visible:
 
-## Roadmap
+- **No autorun.** The agent runs only when the recipient opens it.
+- **Visible at all times.** A window shows a live activity log with Pause, Check now, Open Inbox and Quit.
+- **Writes only inside the drive's `Inbox/` folder.** It never touches the host computer's files, settings or startup items.
+- **Never executes what it downloads.** Executables and scripts are refused by the server *and* by the agent.
+- **Integrity checks.** Every file is hashed with SHA-256: once while downloading, once again after it lands on the drive. A mismatch is discarded and the file stays queued.
+- **Revocable.** Each drive has its own token the owner can revoke or rotate at any time.
 
-- Owner web dashboard with login and drive management
-- Offline queue: files wait on the server until the drive connects
-- Delivery receipts (owner sees when a file arrived)
-- Optional end-to-end encryption of files
-- Auto-update for the agent
-- Windows, macOS, and Linux builds of the agent
+## Requirements
 
-## Suggested stack
-
-- **Server:** Python (FastAPI) or Node (Express), SQLite to start, local disk or S3-compatible storage for files
-- **Drive Agent:** Python or Node, packaged as a single portable executable (PyInstaller or `pkg`)
-- **Owner interface:** CLI first, web dashboard later
-
-## Project structure
-
-```
-Direct-Connection/
-  server/        # API and storage
-  agent/         # portable app that lives on the flash drive
-  owner-cli/     # upload tool for the owner
-  docs/          # design notes
-  README.md
-```
+- Python 3.10+ for the server.
+- Python 3.9+ for the CLI and agent (they use only the standard library). The agent window needs tkinter, which ships with the python.org installers on Windows and macOS.
 
 ## Getting started
 
 ```bash
 git clone https://github.com/TorryO/Direct-Connection.git
 cd Direct-Connection
-opencode
+
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt      # Windows: .venv\Scripts\pip install -r requirements.txt
+
+# Pick an admin key and keep it secret.
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+export DC_ADMIN_KEY=<that value>               # Windows: setx DC_ADMIN_KEY "<that value>"
+
+.venv/bin/python -m server                     # http://127.0.0.1:8000, data in ./data
 ```
+
+Server environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DC_ADMIN_KEY` | *(required, 16+ chars)* | Owner key for the CLI and owner endpoints |
+| `DC_DATA_DIR` | `./data` | SQLite database and uploaded files |
+| `DC_HOST` / `DC_PORT` | `127.0.0.1` / `8000` | Listen address. Put it behind HTTPS before exposing it |
+| `DC_MAX_FILE_BYTES` | `52428800` (50 MiB) | Per-file upload limit |
+
+## Owner workflow
+
+Use `DC_SERVER_URL` (default `http://127.0.0.1:8000`) and `DC_ADMIN_KEY` in the same shell.
+
+```bash
+# Prepare a drive folder: registers the drive, writes direct-connection.json + agent.py, creates Inbox/
+python owner-cli/dc.py provision /media/SAMSTICK --name "Sam's stick"
+
+# Or register a drive without a folder yet
+python owner-cli/dc.py create --name "Sam's stick"     # token is printed once
+
+# Queue files (a note shows up in the agent log)
+python owner-cli/dc.py send <drive-id> letter.pdf photos/*.jpg --note "Trip photos"
+
+# See what is queued and what has arrived
+python owner-cli/dc.py files <drive-id>
+python owner-cli/dc.py drives
+
+# Kill or replace a drive's access
+python owner-cli/dc.py revoke <drive-id>
+python owner-cli/dc.py rotate <drive-id>
+```
+
+Only the SHA-256 hash of each drive token is stored, so a token cannot be recovered from the
+database. If one is lost, rotate it.
+
+## Recipient workflow
+
+The drive contains `agent.py`, `direct-connection.json` and `Inbox/`.
+
+- Windows/macOS: double-click `agent.py`, or run `python agent.py` (or `py agent.py`) if `.py` files are not associated.
+- Linux: `python3 agent.py`
+
+For a one-off check without the window: `python agent.py --once` (logs to the console).
+
+The window shows connection status, every download with its hash result, and errors such as
+"offline" (it simply retries every `poll_seconds`, default 30). If the owner revokes the drive,
+the agent says so and stops downloading.
+
+## API
+
+Owner endpoints require the `X-Admin-Key` header. Agent endpoints require
+`Authorization: Bearer <drive token>`.
+
+| Method | Path | Who | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/api/drives` | owner | Register a drive, returns its token once |
+| `GET` | `/api/drives` | owner | List drives with pending counts |
+| `GET` | `/api/drives/{id}` | owner | One drive |
+| `POST` | `/api/drives/{id}/files` | owner | Upload (`file` part, optional `note` form field) |
+| `GET` | `/api/drives/{id}/files` | owner | Queue with `delivered_at` receipts |
+| `DELETE` | `/api/drives/{id}/files/{file_id}` | owner | Remove a file and its bytes |
+| `POST` | `/api/drives/{id}/revoke` | owner | Permanently disable the drive token |
+| `POST` | `/api/drives/{id}/rotate-token` | owner | Issue a new token, invalidating the old one |
+| `GET` | `/api/agent/me` | agent | Drive name, used by the first-run screen |
+| `GET` | `/api/agent/queue` | agent | Pending files (id, name, size, sha256, note) |
+| `GET` | `/api/agent/files/{file_id}` | agent | Download; `X-Content-Sha256` header |
+| `POST` | `/api/agent/files/{file_id}/ack` | agent | Confirm delivery with the `sha256` form field |
+| `GET` | `/api/health` | anyone | Liveness probe |
+
+Interactive docs are at `/docs` while the server runs.
+
+## Project structure
+
+```
+Direct-Connection/
+  server/            # FastAPI app, SQLite store, local-disk storage
+    app.py           # routes and auth dependencies
+    db.py            # drives + files tables
+    storage.py       # sanitizing, size limits, hashing, atomic writes
+    config.py        # environment-driven settings
+  owner-cli/dc.py    # owner tool (stdlib only)
+  agent/agent.py     # portable agent for the drive (stdlib + tkinter)
+  tests/             # API and end-to-end agent tests
+  requirements.txt
+```
+
+## Tests
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+The agent tests start a real uvicorn server and run the agent against it, including corrupted
+downloads, blocked file types, name collisions and revocation.
+
+## Roadmap
+
+- Owner web dashboard with login and drive management
+- Optional end-to-end encryption of files
+- Auto-update for the agent
+- Windows, macOS and Linux builds of the agent (PyInstaller)
+- Retention limits and per-drive quotas
 
 ## License
 
