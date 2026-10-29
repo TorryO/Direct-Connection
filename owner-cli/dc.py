@@ -17,14 +17,14 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import mimetypes
 import os
 import shutil
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -77,26 +77,34 @@ def _request(
     return json.loads(raw)
 
 
-def _multipart(
-    filename: str, content: bytes, fields: dict[str, str]
-) -> tuple[bytes, str]:
-    boundary = "----directconnection" + uuid.uuid4().hex
-    parts: list[bytes] = []
-    for name, value in fields.items():
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n'
-            f"\r\n{value}\r\n".encode("utf-8")
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _put_file(url: str, path: Path, size: int) -> None:
+    """Upload bytes straight to storage using a presigned URL."""
+    with path.open("rb") as fh:
+        request = urllib.request.Request(
+            url,
+            data=fh,
+            method="PUT",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+            },
         )
-    guessed = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    safe_name = filename.replace('"', "_").replace("\r", "").replace("\n", "")
-    parts.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
-        f'filename="{safe_name}"\r\nContent-Type: {guessed}\r\n\r\n'.encode("utf-8")
-        + content
-        + b"\r\n"
-    )
-    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+        try:
+            with urllib.request.urlopen(request, timeout=300) as resp:
+                resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise CliError(f"storage upload failed ({exc.code}): {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise CliError(f"storage upload failed: {exc.reason}") from exc
 
 
 def _human(size: int) -> str:
@@ -145,16 +153,26 @@ def cmd_send(args: argparse.Namespace) -> int:
             raise CliError(f"Not a file: {path}")
     failures = 0
     for path in paths:
-        content = path.read_bytes()
-        body, content_type = _multipart(
-            path.name, content, {"note": args.note or ""}
-        )
+        size = path.stat().st_size
         try:
+            sha256 = _sha256_of(path)
+            intent = _request(
+                "POST",
+                f"/api/drives/{args.drive_id}/files/upload-url",
+                body=json.dumps(
+                    {"filename": path.name, "size": size, "note": args.note or ""}
+                ).encode("utf-8"),
+                content_type="application/json",
+            )
+            upload_url = urllib.parse.urljoin(
+                _server_url() + "/", intent["upload_url"]
+            )
+            _put_file(upload_url, path, size)
             record = _request(
                 "POST",
-                f"/api/drives/{args.drive_id}/files",
-                body=body,
-                content_type=content_type,
+                f"/api/drives/{args.drive_id}/files/{intent['id']}/complete",
+                body=json.dumps({"sha256": sha256}).encode("utf-8"),
+                content_type="application/json",
             )
         except CliError as exc:
             failures += 1
@@ -224,6 +242,14 @@ def cmd_provision(args: argparse.Namespace) -> int:
     if AGENT_SOURCE.is_file():
         shutil.copy2(AGENT_SOURCE, target / "agent.py")
     print(f"Prepared {target}: {CONFIG_NAME}, agent.py and Inbox/")
+
+    # Tell the server the program is on the drive so the dashboard shows it.
+    try:
+        _request("POST", f"/api/drives/{drive_id}/installed")
+    except CliError as exc:
+        print(f"  warning: could not report the install to the server: {exc}",
+              file=sys.stderr)
+
     print("The recipient starts agent.py themselves; nothing runs automatically.")
     return 0
 

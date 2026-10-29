@@ -149,6 +149,21 @@ class Agent:
         with self._open(path) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _open_url(self, url: str):
+        """Fetch a short-lived storage URL; it carries its own authorisation."""
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "DirectConnectionAgent/0.1"}
+        )
+        try:
+            return urllib.request.urlopen(request, timeout=120)
+        except urllib.error.HTTPError as exc:
+            raise AgentError(
+                f"Download link failed ({exc.code}).", status=exc.code
+            ) from exc
+        except (urllib.error.URLError, ssl.SSLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise AgentError(f"Download link unreachable: {reason}") from exc
+
     def fetch_info(self) -> dict[str, Any]:
         return self._get_json("/api/agent/me")
 
@@ -198,10 +213,14 @@ class Agent:
         target = self._unique_target(filename)
         partial = self.inbox / f".dcpart-{entry['id']}"
         self.log(f"Downloading {filename}…")
+        link = self._get_json(f"/api/agent/files/{entry['id']}/link")
+        download_url = urllib.parse.urljoin(
+            self.server_url.rstrip("/") + "/", str(link.get("url", ""))
+        )
         digest = hashlib.sha256()
         written = 0
         try:
-            with self._open(f"/api/agent/files/{entry['id']}") as resp, partial.open("wb") as out:
+            with self._open_url(download_url) as resp, partial.open("wb") as out:
                 while True:
                     if self.stopped.is_set():
                         raise AgentError("Cancelled.")
